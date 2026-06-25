@@ -1,0 +1,2 @@
+2026-05-21 22:36:47 | INFO | data_feed | MT5 feed initialized for XAUUSD
+2026-05-21 22:36:48 | INFO | __main__ | 127.0.0.1 - "GET /api/state HTTP/1.1" 200 -

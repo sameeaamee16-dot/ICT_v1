@@ -1,0 +1,3 @@
+2026-05-21 22:34:19 | INFO | terminal_server | 127.0.0.1 - "GET /api/state HTTP/1.1" 200 -
+2026-05-21 22:34:19 | INFO | terminal_server | 127.0.0.1 - "GET /api/trades HTTP/1.1" 200 -
+2026-05-21 22:34:20 | INFO | data_feed | MT5 feed initialized for XAUUSD
