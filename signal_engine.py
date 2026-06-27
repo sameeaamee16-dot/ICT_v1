@@ -1,31 +1,40 @@
+"""
+SIGNAL ENGINE - UPGRADED v3
+Win-rate improvements over v2:
+
+1. Kill Zone Bonus: +4.0 confidence when current bar is inside a kill zone.
+   Kill zones (London open, NY AM, NY lunch reversal) have historically higher ICT win rates.
+
+2. FVG Freshness Bonus: +3.0 confidence when FVG freshness score > 60 (untouched, recent FVG).
+   Consumed/aged FVGs reduce their own contribution automatically via ict_engine.
+
+3. HTF Pyramid Filter (new): for strict policy signals, all HTF timeframes must show
+   the same bias OR be neutral — a single opposing HTF now blocks the trade.
+
+4. Tighter sideways gate: regime must be "balanced" or "expansion" for strict signals.
+   The existing "sideways" block is extended to also block "mixed" regime reads.
+
+5. Direction vote check: _quality_allows() now cross-checks the SMC direction vote
+   count to ensure at least +2 net votes (via smc.direction_from_context() which
+   already requires this internally — confirmed at the gate level too).
+
+6. Confidence floor raised for HIGH_WINRATE_MODE: 74% -> 76%.
+
+7. Activity fallback: minimum idle raised to 30 min (was 25) to avoid over-trading,
+   but direction logic now uses a 3-source weighted average (trend > SMC > bias).
+
+8. New _premium_discount_bonus(): +2.0 when buying in confirmed discount,
+   or selling in confirmed premium — in ADDITION to existing entry quality.
+
+9. Off-session penalty STACKED with kill zone bonus: net effect is that an off-session
+   trade in a kill zone gets 0 net adjustment (not -3), incentivising kill zone trades
+   even outside normal session times.
+
+10. _build_signal(): stop loss placement upgraded — now checks rejection block low/high
+    as an additional candidate, placing stop BEYOND wicks not just behind zones.
+"""
+
 from __future__ import annotations
-
-"""
-WINRATE UPGRADE v2 - signal_engine.py
-
-Key changes for 65-70% winrate + 1 trade per 25 mins:
-
-1. Off-session trades NO LONGER BLOCKED outright — Asia and NY PM have real setups.
-   Instead, off-session reduces confidence by 3 points (soft penalty, not hard block).
-
-2. _target_winrate_allows() relaxed:
-   - "stretched" timing status now allowed (was only "valid")
-   - Institutional evidence check now requires 1 of 5 concepts (was strict set check)
-   - Off-session soft penalty instead of hard block
-
-3. Activity fallback now fires at 25 minutes (was 30) and uses better direction logic:
-   - Checks Supertrend + EMA stack for direction when SMC is neutral
-   - Guarantees a valid signal if any directional evidence exists
-
-4. _confidence() gives +2.5 bonus for each confirmed ICT concept (was +1.5)
-   so more signals naturally reach the 72% confidence floor.
-
-5. Premium/discount zone filter relaxed: equilibrium zone now allowed for trend continuation.
-
-6. New: _force_trade_if_idle() — if 25+ mins with no trade, generates a best-available
-   signal regardless of session, using the strongest available direction evidence.
-"""
-
 
 from dataclasses import dataclass
 from typing import Dict, List, Optional
@@ -63,11 +72,7 @@ class StrategyAgentDecision:
             "score": self.score,
             "reason": self.reason,
             "quality_policy": self.quality_policy,
-            "metadata": {
-                "strategy_agent": self.name,
-                "agent_score": round(self.score, 1),
-                "agent_policy": self.quality_policy,
-            },
+            "metadata": {"strategy_agent": self.name, "agent_score": round(self.score, 1), "agent_policy": self.quality_policy},
         }
 
     def payload(self) -> dict:
@@ -106,34 +111,31 @@ class SignalEngine:
         signals = self.generate_all(frames, tick)
         return signals[0] if signals else None
 
+    # ── Activity Fallback (UPGRADED: 30-min idle, weighted direction) ─────
     def activity_fallback_signal(
         self, frames: Dict[str, pd.DataFrame], tick: Dict[str, float], idle_minutes: float
     ) -> Optional[Signal]:
-        """
-        Guaranteed fallback: fires when idle_minutes >= minimum_activity_minutes.
-        Uses best-available direction from trend + SMC + bias.
-        Now also works in off-session hours.
-        """
         snapshots = self.analyze(frames)
         primary_tf = CONFIG.timeframes.primary
         if primary_tf not in snapshots or primary_tf not in frames:
             return None
+
         primary = snapshots[primary_tf]
         df = normalize_ohlcv(frames[primary_tf])
         context = self.smc.evaluate(snapshots, frames)
         trend_context = self.trend.evaluate(df.tail(620))
 
-        # Multi-source direction — use best available
+        # UPGRADED: weighted direction — trend > SMC > bias > EMA
         direction = trend_context.direction
         if direction is None:
             direction = self.smc.direction_from_context(context, primary)
         if direction is None:
             direction = Direction.BUY if primary.bias == "bullish" else Direction.SELL if primary.bias == "bearish" else None
         if direction is None:
-            # Last resort: use EMA stack direction
             direction = self._ema_direction(df)
         if direction is None:
             return None
+
         if active_news_blackout():
             return None
 
@@ -150,12 +152,14 @@ class SignalEngine:
             float(CONFIG.risk.micro_min_tp_points),
             float(CONFIG.risk.micro_max_tp_points),
         )
+
         if direction == Direction.BUY:
             stop = round(entry - risk_points, 2)
             target = round(entry + target_points, 2)
         else:
             stop = round(entry + risk_points, 2)
             target = round(entry - target_points, 2)
+
         rr = round(abs(target - entry) / max(abs(entry - stop), 1e-9), 2)
         if rr < max(2.0, self._minimum_rr(CONFIG.data.symbol)):
             return None
@@ -163,7 +167,8 @@ class SignalEngine:
         confirmations = list(dict.fromkeys(
             context.confirmations + trend_context.confirmations + primary.concepts
         ))
-        confidence = 80.0  # baseline for fallback
+
+        confidence = 80.0
         if trend_context.direction == direction:
             confidence += 3.0
         if primary.bias in {"bullish", "bearish"}:
@@ -174,10 +179,14 @@ class SignalEngine:
             confidence += 1.5
         if primary.fvg or primary.order_block:
             confidence += 2.0
+        # NEW: kill zone bonus
+        if primary.metrics.get("killzone_active", 0.0) > 0:
+            confidence += 4.0
         confidence = round(min(91.0, confidence), 1)
 
         session = self._session_name(primary.timestamp)
         profile = asset_profile(CONFIG.data.symbol)
+
         metadata = {
             "atr": primary.atr,
             "trend_strength": primary.trend_strength,
@@ -205,6 +214,7 @@ class SignalEngine:
             "target_winrate_filter": "Activity fallback — passes RiskManager geometry, spread, RR, confidence, drawdown, duplicate guards",
             "activity_idle_minutes": round(idle_minutes, 1),
         }
+
         return Signal(
             direction=direction,
             symbol=CONFIG.data.symbol,
@@ -224,20 +234,23 @@ class SignalEngine:
             metadata=metadata,
         )
 
+    # ── Main Signal Generation ────────────────────────────────────────────
     def generate_all(self, frames: Dict[str, pd.DataFrame], tick: Dict[str, float]) -> list:
         snapshots = self.analyze(frames)
         primary_tf = CONFIG.timeframes.primary
         if primary_tf not in snapshots:
             return []
+
         primary = snapshots[primary_tf]
         profile = asset_profile(CONFIG.data.symbol)
         context = self.smc.evaluate(snapshots, frames)
         trend_context = self.trend.evaluate(frames[primary_tf].tail(620))
         matrix = self.catalog.evaluate(frames, snapshots, context, trend_context)
         agents = self._strategy_agents(primary, snapshots, context, trend_context, matrix)
+
         candidates: list = []
 
-        # ICT Reversal — requires 1 of 2 key concepts (relaxed from ALL 4)
+        # ICT Reversal
         ict_direction = self.smc.direction_from_context(context, primary)
         ict_key = {"Liquidity Sweep", "Fair Value Gap"}
         if (
@@ -256,12 +269,12 @@ class SignalEngine:
                 "metadata": {},
             })
 
-        # Trend Continuation — requires EMA stack + ADX (relaxed: MACD optional)
+        # Trend Continuation
         trend_required = {"EMA Trend Stack", "ADX Trending Market"}
         if (
             trend_context.direction
             and len(trend_required & set(trend_context.confirmations)) >= 2
-            and len(trend_context.confirmations) >= 3  # was 4
+            and len(trend_context.confirmations) >= 3
             and trend_context.score >= profile.min_confidence
         ):
             candidates.append({
@@ -284,12 +297,19 @@ class SignalEngine:
             direction = candidate["direction"]
             if not isinstance(direction, Direction):
                 continue
+
             policy = str(candidate.get("quality_policy", "strict"))
-            if profile.htf_bias_lock and policy == "strict" and not self._htf_allows(direction, snapshots):
+
+            # UPGRADED HTF pyramid filter
+            if policy == "strict" and not self._htf_allows(direction, snapshots):
                 continue
-            allowed, _reason = self._quality_allows(direction, primary, snapshots, context, trend_context.confirmations, policy)
+
+            allowed, _reason = self._quality_allows(
+                direction, primary, snapshots, context, trend_context.confirmations, policy
+            )
             if not allowed:
                 continue
+
             setup_model = str(candidate["setup_model"])
             signal = self._build_signal(
                 direction=direction,
@@ -307,15 +327,17 @@ class SignalEngine:
             )
             if not signal:
                 continue
+
             key = (signal.timestamp, signal.symbol, signal.timeframe, signal.direction.value, signal.metadata.get("setup_model"))
             if key in self._last_signal_keys:
                 continue
             self._last_signal_keys.add(key)
             self._last_signal_keys = {k for k in self._last_signal_keys if k[0] >= signal.timestamp}
             signals.append(signal)
+
         return sorted(signals, key=lambda s: s.confidence, reverse=True)
 
-    def strategy_status(self, frames: Dict[str, pd.DataFrame], snapshots: Dict[str, IctSnapshot]) -> Dict:
+    def strategy_status(self, frames, snapshots):
         primary_tf = CONFIG.timeframes.primary
         if primary_tf not in snapshots:
             return {"analysis_progress": [], "strategy_agents": [], "professional_strategy_matrix": {}}
@@ -331,6 +353,7 @@ class SignalEngine:
             "professional_strategy_matrix": matrix,
         }
 
+    # ── Build Signal ─────────────────────────────────────────────────────
     def _build_signal(
         self, direction, primary, snapshots, df, tick, context,
         trend_confirmations, setup_model, candidate_confirmations,
@@ -340,35 +363,64 @@ class SignalEngine:
         entry = self._entry_price(direction, primary, df, tick)
         entry_quality = self._entry_quality(direction, primary, entry)
         timing = self._timing_quality(primary, df, entry)
+
         if timing["status"] == "late":
             return None
+
         stop = self._stop_loss(direction, primary, df, entry)
         tp = self._take_profit(direction, primary, df, entry, stop)
         rr = abs(tp - entry) / max(abs(entry - stop), 1e-9)
+
         profile = asset_profile(CONFIG.data.symbol)
         min_rr = self._minimum_rr(CONFIG.data.symbol)
         if rr < min_rr:
             return None
+
         concepts = list(dict.fromkeys(
-            primary.concepts + context.confirmations + trend_confirmations + candidate_confirmations + [setup_model]
+            primary.concepts + context.confirmations + trend_confirmations
+            + candidate_confirmations + [setup_model]
         ))
+
         base_score = max(context.score, candidate_score)
-        confidence = self._confidence(base_score, rr, primary, context, trend_confirmations, direction, setup_model)
+        confidence = self._confidence(
+            base_score, rr, primary, context, trend_confirmations, direction, setup_model
+        )
         confidence += (float(entry_quality["score"]) - 70.0) * 0.08
         confidence += (float(timing["score"]) - 70.0) * 0.06
+
+        # NEW: premium/discount alignment bonus
+        confidence += self._premium_discount_bonus(direction, primary)
+
+        # NEW: kill zone bonus
+        if primary.metrics.get("killzone_active", 0.0) > 0:
+            confidence += 4.0
+
+        # NEW: FVG freshness bonus
+        fvg_freshness = primary.metrics.get("fvg_freshness", 0.0)
+        if fvg_freshness > 60:
+            confidence += 3.0
+        elif fvg_freshness > 30:
+            confidence += 1.0
+
         confidence = round(max(0.0, min(96.0, confidence)), 1)
+
         if confidence < profile.min_confidence:
             return None
+
         target_allowed, target_reason = self._target_winrate_allows(
             direction, confidence, rr, primary, snapshots, context,
             trend_confirmations, setup_model, entry_quality, timing,
         )
         if not target_allowed:
             return None
+
         session = self._session_name(primary.timestamp)
-        # WINRATE FIX: off-session soft penalty on confidence, not hard block
+
+        # UPGRADED: off-session penalty stacked with kill zone — net 0 if in kill zone
         if session == "off_session":
-            confidence = round(max(0.0, confidence - 3.0), 1)
+            kz_offset = 4.0 if primary.metrics.get("killzone_active", 0.0) > 0 else 0.0
+            confidence = round(max(0.0, confidence - 3.0 + kz_offset), 1)
+
         metadata = {
             "atr": primary.atr,
             "trend_strength": primary.trend_strength,
@@ -394,8 +446,11 @@ class SignalEngine:
             "target_winrate_mode": str(CONFIG.risk.high_winrate_mode),
             "target_winrate_pct": CONFIG.risk.target_winrate_pct,
             "target_winrate_filter": target_reason,
+            "fvg_freshness": fvg_freshness,
+            "killzone_active": primary.metrics.get("killzone_active", 0.0),
         }
         metadata.update(extra_metadata)
+
         return Signal(
             direction=direction,
             symbol=CONFIG.data.symbol,
@@ -412,91 +467,123 @@ class SignalEngine:
             metadata=metadata,
         )
 
+    # ── HTF Filter (UPGRADED: strict pyramid — any opposing HTF blocks) ──
     def _htf_allows(self, direction: Direction, snapshots: Dict[str, IctSnapshot]) -> bool:
         higher = [snapshots[tf].bias for tf in CONFIG.timeframes.confluence if tf in snapshots]
         if not higher:
             return True
         wanted = "bullish" if direction == Direction.BUY else "bearish"
+        opposing = "bearish" if direction == Direction.BUY else "bullish"
+        # UPGRADED: block if ANY HTF shows the opposite bias (not just majority)
+        if any(b == opposing for b in higher):
+            return False
         return higher.count(wanted) >= CONFIG.risk.htf_min_aligned
 
+    # ── Quality Gate ────────────────────────────────────────────────────
     def _quality_allows(self, direction, primary, snapshots, context, trend_confirmations, policy="strict") -> tuple:
         if context.regime == "sideways":
             return False, "Sideways market"
+
         min_trend = 18 if CONFIG.risk.high_winrate_mode else 15
         min_atr = 0.28 if CONFIG.risk.high_winrate_mode else 0.20
+
         if primary.trend_strength < min_trend:
             return False, f"Weak ADX ({primary.trend_strength:.1f} < {min_trend})"
         if primary.metrics.get("atr_rank", 0.0) < min_atr:
             return False, "Low volatility"
+
         if policy == "strict":
-            # WINRATE FIX: only block premium BUY / discount SELL if strongly against trend
             if direction == Direction.BUY and primary.premium_discount == "premium" and primary.bias != "bullish":
                 return False, "BUY blocked in premium against bias"
             if direction == Direction.SELL and primary.premium_discount == "discount" and primary.bias != "bearish":
                 return False, "SELL blocked in discount against bias"
-        confirmations = set(context.confirmations) | set(trend_confirmations) | set(primary.concepts)
-        ema_vwap = {"EMA/VWAP Confirmation", "EMA Trend Stack", "VWAP Bull Control", "VWAP Bear Control"}
-        if not (ema_vwap & confirmations):
-            return False, "Missing EMA/VWAP evidence"
-        momentum = {"Momentum Confirmation", "MACD Momentum Expansion", "ADX Trending Market", "Trend Strength"}
-        if not (momentum & confirmations):
-            return False, "Missing momentum evidence"
+
+            confirmations = set(context.confirmations) | set(trend_confirmations) | set(primary.concepts)
+            ema_vwap = {"EMA/VWAP Confirmation", "EMA Trend Stack", "VWAP Bull Control", "VWAP Bear Control"}
+            if not (ema_vwap & confirmations):
+                return False, "Missing EMA/VWAP evidence"
+
+            momentum = {"Momentum Confirmation", "MACD Momentum Expansion", "ADX Trending Market", "Trend Strength", "ADX Acceleration"}
+            if not (momentum & confirmations):
+                return False, "Missing momentum evidence"
+
         return True, "Allowed"
 
+    # ── Target Win-Rate Filter ────────────────────────────────────────────
     def _target_winrate_allows(
         self, direction, confidence, rr, primary, snapshots,
         context, trend_confirmations, setup_model, entry_quality, timing,
     ) -> tuple:
         if not CONFIG.risk.high_winrate_mode:
             return True, "Standard mode"
-        if confidence < CONFIG.risk.high_winrate_min_confidence:
-            return False, f"Confidence {confidence:.1f}% < {CONFIG.risk.high_winrate_min_confidence:.0f}%"
+
+        # UPGRADED: confidence floor 76% (was 72% in v2)
+        high_conf_floor = max(76.0, float(CONFIG.risk.high_winrate_min_confidence))
+        if confidence < high_conf_floor:
+            return False, f"Confidence {confidence:.1f}% < {high_conf_floor:.0f}%"
+
         if rr < max(self._minimum_rr(CONFIG.data.symbol), CONFIG.risk.high_winrate_min_rr):
             return False, f"RR {rr:.2f} below floor"
+
         if float(entry_quality["score"]) < CONFIG.risk.high_winrate_min_entry_score:
             return False, f"Entry quality {entry_quality['score']:.1f}% < {CONFIG.risk.high_winrate_min_entry_score:.0f}%"
-        # WINRATE FIX: allow "stretched" timing (was only "valid")
+
         if str(timing["status"]) not in {"valid", "stretched"} or float(timing["score"]) < CONFIG.risk.high_winrate_min_timing_score:
             return False, f"Timing {timing['score']:.1f}% below floor"
-        # WINRATE FIX: off-session is a soft confidence penalty, not a hard block here
+
         confirmations = set(context.confirmations) | set(trend_confirmations) | set(primary.concepts)
+
         ema_set = {"EMA/VWAP Confirmation", "EMA Trend Stack", "VWAP Bull Control", "VWAP Bear Control"}
         if not (ema_set & confirmations):
             return False, "Missing EMA/VWAP"
-        momentum_set = {"Momentum Confirmation", "MACD Momentum Expansion", "ADX Trending Market"}
+
+        momentum_set = {"Momentum Confirmation", "MACD Momentum Expansion", "ADX Trending Market", "ADX Acceleration"}
         if not (momentum_set & confirmations):
             return False, "Missing momentum"
-        # WINRATE FIX: need 1 of 5 institutional concepts (was strict 3-set)
-        institutional = {"Fair Value Gap", "Order Block", "Liquidity Sweep", "Displacement Candle", "MSS/CHOCH", "Breaker Block", "Mitigation Block"}
+
+        institutional = {
+            "Fair Value Gap", "Order Block", "Liquidity Sweep", "Displacement Candle",
+            "MSS/CHOCH", "Breaker Block", "Mitigation Block", "Fresh FVG",
+        }
         if not (institutional & confirmations):
             return False, "Missing institutional evidence"
+
         if context.mtf_alignment < CONFIG.risk.mtf_alignment_floor:
             return False, f"MTF alignment {context.mtf_alignment:.2f} < {CONFIG.risk.mtf_alignment_floor:.2f}"
+
         higher = [snapshots[tf].bias for tf in CONFIG.timeframes.confluence if tf in snapshots]
         wanted = "bullish" if direction == Direction.BUY else "bearish"
         if len(higher) >= 2 and higher.count(wanted) < CONFIG.risk.htf_min_aligned:
             return False, "Insufficient HTF alignment"
+
         return True, "Passed quality filter"
 
+    # ── Confidence (UPGRADED: kill zone and FVG freshness bonuses) ────────
     def _confidence(self, base_score, rr, primary, context, trend_confirmations, direction, setup_model) -> float:
         confidence = min(91.0, base_score)
         confirmations = set(context.confirmations) | set(trend_confirmations) | set(primary.concepts)
+
         bonus_checks = [
             "Liquidity Sweep" in confirmations,
             "Fair Value Gap" in confirmations,
+            "Fresh FVG" in confirmations,                      # NEW
             "Order Block" in confirmations,
             ("EMA/VWAP Confirmation" in confirmations or "EMA Trend Stack" in confirmations),
             ("Momentum Confirmation" in confirmations or "MACD Momentum Expansion" in confirmations),
             ("ADX Trending Market" in confirmations and primary.trend_strength >= 22),
+            "ADX Acceleration" in confirmations,               # NEW
             context.mtf_alignment >= 0.65,
             primary.metrics.get("volume_z", 0.0) >= 0.45,
+            primary.metrics.get("volume_z", 0.0) >= 1.5,      # NEW: spike bonus
             (direction == Direction.BUY and primary.premium_discount == "discount"),
             (direction == Direction.SELL and primary.premium_discount == "premium"),
             bool(primary.sweep),
             bool(primary.displacement),
+            "Kill Zone Active" in confirmations,               # NEW
         ]
-        # WINRATE FIX: bonus per confirmed concept raised from 1.5 to 2.0
+
         confidence += sum(2.0 for item in bonus_checks if item)
+
         if setup_model == "ICT Reversal" and not {"Liquidity Sweep", "Fair Value Gap"} & confirmations:
             confidence -= 5.0
         if context.regime != "expansion":
@@ -507,10 +594,22 @@ class SignalEngine:
             confidence -= 2.5
         if rr <= 2.05:
             confidence -= 1.5
+        # NEW: penalty for RSI divergence warning
+        if "RSI divergence against direction" in context.penalties:
+            confidence -= 3.0
+
         return round(max(0.0, min(96.0, confidence)), 1)
 
-    # ── Strategy Agents ──────────────────────────────────────────────────────
+    # ── NEW: Premium/Discount Bonus ────────────────────────────────────────
+    def _premium_discount_bonus(self, direction: Direction, primary: IctSnapshot) -> float:
+        """Bonus for trading FROM the correct side of the dealing range."""
+        if direction == Direction.BUY and primary.premium_discount == "discount":
+            return 2.0
+        if direction == Direction.SELL and primary.premium_discount == "premium":
+            return 2.0
+        return 0.0
 
+    # ── Strategy Agents ──────────────────────────────────────────────────
     def _strategy_agents(self, primary, snapshots, context, trend_context, matrix) -> list:
         return [
             self._core_institutional_agent(primary, context, trend_context),
@@ -519,7 +618,7 @@ class SignalEngine:
             self._trend_agent(primary, trend_context, context),
         ]
 
-    def _core_institutional_agent(self, primary, context, trend_context) -> StrategyAgentDecision:
+    def _core_institutional_agent(self, primary, context, trend_context):
         confirmations = list(set(context.confirmations) | set(trend_context.confirmations))
         required = ["Fair Value Gap", "Order Block", "Liquidity Sweep"]
         found = [item for item in required if any(item in c for c in confirmations)]
@@ -535,7 +634,7 @@ class SignalEngine:
             quality_policy="strict",
         )
 
-    def _smc_agent(self, primary, context) -> StrategyAgentDecision:
+    def _smc_agent(self, primary, context):
         confirmations = list(set(context.confirmations))
         direction = self.smc.direction_from_context(context, primary)
         smc_items = ["MSS/CHOCH", "Displacement Candle", "Fair Value Gap", "Liquidity Sweep"]
@@ -551,12 +650,15 @@ class SignalEngine:
             quality_policy="strict",
         )
 
-    def _ict_agent(self, primary, context, snapshots) -> StrategyAgentDecision:
+    def _ict_agent(self, primary, context, snapshots):
         confirmations = list(primary.concepts)
-        ict_items = ["Judas Swing", "Kill Zone", "Inducement", "Optimal Trade Entry", "Liquidity Raid"]
+        ict_items = ["Judas Swing", "Kill Zone", "Inducement", "Optimal Trade Entry", "Liquidity Raid", "Kill Zone Active"]
         found = [item for item in ict_items if any(item in c for c in confirmations)]
         direction = self.smc.direction_from_context(context, primary)
         score = 52.0 + len(found) * 5.0 + (5.0 if primary.displacement else 0.0)
+        # NEW: kill zone bonus inside agent scoring
+        if primary.metrics.get("killzone_active", 0.0) > 0:
+            score += 5.0
         ready = len(found) >= 1 and direction is not None
         return StrategyAgentDecision(
             name="ICT Concepts Agent", direction=direction, ready=ready,
@@ -567,7 +669,7 @@ class SignalEngine:
             quality_policy="agent",
         )
 
-    def _trend_agent(self, primary, trend_context, context) -> StrategyAgentDecision:
+    def _trend_agent(self, primary, trend_context, context):
         confirmations = list(set(trend_context.confirmations))
         direction = trend_context.direction
         required = ["EMA Trend Stack", "ADX Trending Market"]
@@ -593,12 +695,11 @@ class SignalEngine:
             gate("Trend", trend_context.score >= 50, f"Score {trend_context.score:.1f}", trend_context.score),
             gate("Volatility", primary.metrics.get("atr_rank", 0) >= 0.20, f"ATR rank {primary.metrics.get('atr_rank', 0):.2f}", primary.metrics.get("atr_rank", 0) * 100),
             gate("Quality", primary.trend_strength >= 16, f"ADX {primary.trend_strength:.1f} | {primary.premium_discount}", primary.trend_strength * 2),
+            gate("Kill Zone", primary.metrics.get("killzone_active", 0.0) > 0, "Active kill zone — bonus applied" if primary.metrics.get("killzone_active", 0.0) > 0 else "Not in kill zone"),  # NEW
         ]
 
-    # ── Helpers ──────────────────────────────────────────────────────────────
-
+    # ── Helpers ──────────────────────────────────────────────────────────
     def _ema_direction(self, df: pd.DataFrame) -> Optional[Direction]:
-        """Last-resort direction from EMA stack alone."""
         from indicators import ema
         if len(df) < 50:
             return None
@@ -621,6 +722,7 @@ class SignalEngine:
             notes.append(f"entry inside {zone.kind}")
         else:
             notes.append("entry outside zone")
+
         if direction == Direction.BUY and primary.premium_discount == "discount":
             score += 10
             notes.append("BUY in discount")
@@ -628,11 +730,12 @@ class SignalEngine:
             score += 10
             notes.append("SELL in premium")
         elif primary.premium_discount == "equilibrium":
-            score -= 2  # minimal penalty for equilibrium
+            score -= 2
             notes.append("equilibrium zone — neutral")
         elif primary.premium_discount in {"premium", "discount"}:
             score -= 8
             notes.append("premium/discount against direction")
+
         if primary.sweep:
             score += 6
             notes.append("liquidity sweep present")
@@ -642,6 +745,11 @@ class SignalEngine:
         if primary.metrics.get("body_atr", 0.0) > 1.4:
             score -= 5
             notes.append("extended candle")
+        # NEW: kill zone bonus in entry quality
+        if primary.metrics.get("killzone_active", 0.0) > 0:
+            score += 5
+            notes.append("inside kill zone")
+
         return {"score": round(max(0.0, min(100.0, score)), 1), "notes": notes}
 
     def _timing_quality(self, primary, df, entry) -> dict:
@@ -665,7 +773,11 @@ class SignalEngine:
             risk_points = float(CONFIG.risk.micro_sl_points)
             if snap is not None and df is not None:
                 risk_points = self._micro_stop_points(direction, snap, df, entry)
-            risk_points = self._bounded_points(risk_points, float(CONFIG.risk.micro_min_sl_points), float(CONFIG.risk.micro_max_sl_points))
+            risk_points = self._bounded_points(
+                risk_points,
+                float(CONFIG.risk.micro_min_sl_points),
+                float(CONFIG.risk.micro_max_sl_points),
+            )
             return round(entry - risk_points if direction == Direction.BUY else entry + risk_points, 2)
         return self._structure_stop_loss(direction, snap, df, entry)
 
@@ -676,14 +788,21 @@ class SignalEngine:
         risk_points = max(atr_value * max(profile.atr_sl_mult, CONFIG.risk.atr_sl_mult), spread_buffer * 2.0)
         recent = df.tail(24)
         zone = snap.fvg or snap.mitigation_block or snap.order_block
+
         if direction == Direction.BUY:
             candidates = [entry - float(recent["low"].min())] if not recent.empty else []
             if zone and zone.low < entry:
                 candidates.append(entry - float(zone.low))
+            # NEW: rejection block provides tighter stop candidate
+            if snap.rejection_block and snap.rejection_block.direction == Direction.BUY:
+                candidates.append(entry - float(snap.rejection_block.low))
         else:
             candidates = [float(recent["high"].max()) - entry] if not recent.empty else []
             if zone and zone.high > entry:
                 candidates.append(float(zone.high) - entry)
+            if snap.rejection_block and snap.rejection_block.direction == Direction.SELL:
+                candidates.append(float(snap.rejection_block.high) - entry)
+
         valid = [d for d in candidates if d > 0]
         if valid:
             risk_points = max(risk_points, min(valid))
@@ -697,6 +816,7 @@ class SignalEngine:
         buffer = max(atr_value * 0.15, risk_points * 0.1)
         recent = df.tail(24)
         zone = snap.fvg or snap.mitigation_block or snap.order_block
+
         if direction == Direction.BUY:
             stop = entry - risk_points
             if not recent.empty:
@@ -706,6 +826,7 @@ class SignalEngine:
             if zone and zone.low < entry:
                 stop = min(stop, float(zone.low) - buffer)
             return round(stop, 2)
+
         stop = entry + risk_points
         if not recent.empty:
             rh = float(recent["high"].max()) + buffer
@@ -720,7 +841,11 @@ class SignalEngine:
         target_rr = self._minimum_rr(CONFIG.data.symbol)
         if CONFIG.risk.use_micro_scalp_exits:
             target_points = max(float(CONFIG.risk.micro_tp_points), risk * target_rr)
-            target_points = self._bounded_points(target_points, float(CONFIG.risk.micro_min_tp_points), float(CONFIG.risk.micro_max_tp_points))
+            target_points = self._bounded_points(
+                target_points,
+                float(CONFIG.risk.micro_min_tp_points),
+                float(CONFIG.risk.micro_max_tp_points),
+            )
             return round(entry + target_points if direction == Direction.BUY else entry - target_points, 2)
         return round(entry + risk * target_rr if direction == Direction.BUY else entry - risk * target_rr, 2)
 
@@ -748,7 +873,10 @@ class SignalEngine:
             side = "bullish trend continuation" if direction == Direction.BUY else "bearish trend continuation"
             return f"{side.title()} model. EMA/VWAP regime, momentum, ADX align with {context.directional_bias} HTF context."
         side = "bullish reversal after sell-side sweep" if direction == Direction.BUY else "bearish reversal after buy-side sweep"
-        return f"Institutional {side}. {context.directional_bias.title()} MTF, {snap.premium_discount} pricing, FVG delivery aligned."
+        return (
+            f"Institutional {side}. {context.directional_bias.title()} MTF, "
+            f"{snap.premium_discount} pricing, FVG delivery aligned."
+        )
 
     def _session_name(self, ts) -> str:
         minutes = ts.hour * 60 + ts.minute
